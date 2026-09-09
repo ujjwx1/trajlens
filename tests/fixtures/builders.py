@@ -761,7 +761,9 @@ def build_v3_corrupt_video(root: Path, *, camera: str = "top") -> None:
     )
 
 
-def _write_real_mp4(path: Path, *, num_frames: int = 5, fps: int | Fraction = 30) -> None:
+def _write_real_mp4(
+    path: Path, *, num_frames: int = 5, fps: int | Fraction = 30, gop_size: int | None = None
+) -> None:
     """Write a minimal but genuinely decodable MP4 using PyAV.
 
     Produces ``num_frames`` solid-colour frames at 16x16 (the smallest
@@ -775,6 +777,14 @@ def _write_real_mp4(path: Path, *, num_frames: int = 5, fps: int | Fraction = 30
     NTSC drop-frame ~29.97) so REPAIR.VIDEO_METADATA_SYNC's rounding
     behavior can be tested against a real, non-integer container rate --
     not just the always-integer rates every other fixture in this module uses.
+
+    ``gop_size`` forces a keyframe every N frames (libx264's ``g``/
+    ``keyint_min`` options). Left unset, ultrafast/crf encoding of a short,
+    low-motion clip collapses to a single keyframe at the start, which makes
+    every seek in the file land at frame 0 regardless of target -- fine for
+    most fixtures, but useless for testing that VIDEO.DECODABLE_SPOTCHECK's
+    'middle'/'last' positions genuinely seek to distinct points rather than
+    always decoding from the start.
     """
     import ctypes
 
@@ -785,7 +795,11 @@ def _write_real_mp4(path: Path, *, num_frames: int = 5, fps: int | Fraction = 30
         stream.width = 16
         stream.height = 16
         stream.pix_fmt = "yuv420p"
-        stream.options = {"crf": "23", "preset": "ultrafast"}
+        options = {"crf": "23", "preset": "ultrafast"}
+        if gop_size is not None:
+            options["g"] = str(gop_size)
+            options["keyint_min"] = str(gop_size)
+        stream.options = options
         for i in range(num_frames):
             frame = av.VideoFrame(16, 16, "rgb24")
             frame.pts = i
