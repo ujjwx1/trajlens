@@ -39,7 +39,7 @@ from trajlens.checks.statistical import (
 )
 from trajlens.errors import RepairError
 from trajlens.model.canonical import CanonicalDataset
-from trajlens.repair.protocol import Diff, RepairSummary, StatChange
+from trajlens.repair.protocol import Diff, RepairSummary, StatChange, replace_output_dir
 from trajlens.sources.paths import safe_join
 
 log = structlog.get_logger(__name__)
@@ -255,8 +255,7 @@ class StatsRecomputeFixer:
             num_changes=len(diff.changes),
         )
 
-        if output_path.exists():
-            shutil.rmtree(output_path)
+        replace_output_dir(output_path)
         shutil.copytree(source_root, output_path)
 
         if diff.is_noop:

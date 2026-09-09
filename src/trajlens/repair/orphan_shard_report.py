@@ -47,7 +47,7 @@ import structlog
 
 from trajlens.errors import RepairError
 from trajlens.model.canonical import CanonicalDataset
-from trajlens.repair.protocol import Diff, FeatureFieldChange, RepairSummary
+from trajlens.repair.protocol import Diff, FeatureFieldChange, RepairSummary, replace_output_dir
 from trajlens.sources.paths import safe_join
 from trajlens.sources.version import DatasetVersion
 
@@ -248,8 +248,7 @@ class OrphanShardReportFixer:
             quarantine=self.quarantine,
         )
 
-        if output_path.exists():
-            shutil.rmtree(output_path)
+        replace_output_dir(output_path)
         shutil.copytree(source_root, output_path)
 
         if not self.quarantine or not orphans:

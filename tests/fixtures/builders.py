@@ -18,6 +18,7 @@ checked, not the docstring.
 from __future__ import annotations
 
 import json
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -760,7 +761,7 @@ def build_v3_corrupt_video(root: Path, *, camera: str = "top") -> None:
     )
 
 
-def _write_real_mp4(path: Path, *, num_frames: int = 5, fps: int = 30) -> None:
+def _write_real_mp4(path: Path, *, num_frames: int = 5, fps: int | Fraction = 30) -> None:
     """Write a minimal but genuinely decodable MP4 using PyAV.
 
     Produces ``num_frames`` solid-colour frames at 16x16 (the smallest
@@ -769,6 +770,11 @@ def _write_real_mp4(path: Path, *, num_frames: int = 5, fps: int = 30) -> None:
 
     Codec choice mirrors LeRobot's default encoder
     (lerobot/datasets/video_utils.py encode_video_frames → libx264).
+
+    ``fps`` accepts a Fraction (e.g. ``Fraction(30000, 1001)`` for genuine
+    NTSC drop-frame ~29.97) so REPAIR.VIDEO_METADATA_SYNC's rounding
+    behavior can be tested against a real, non-integer container rate --
+    not just the always-integer rates every other fixture in this module uses.
     """
     import ctypes
 
@@ -841,6 +847,42 @@ def build_v3_video_fps_match(root: Path, *, camera: str = "top", fps: int = 30) 
     build_v3_dataset(root, camera=camera, fps=fps)
     video_path = root / "videos" / camera / "chunk-000" / "file-000.mp4"
     _write_real_mp4(video_path, fps=fps)
+
+
+def build_v3_video_ntsc_dropframe_declared_matching(
+    root: Path, *, camera: str = "top", declared_fps: int = 30
+) -> None:
+    """Build a v3.0 dataset whose video container is genuine NTSC drop-frame
+    (30000/1001 ~= 29.97fps) while info.json declares the physically correct
+    whole-number fps (30).
+
+    Regression fixture for REPAIR.VIDEO_METADATA_SYNC's fps-rounding fix: a
+    prior version compared/wrote the container's RAW rational rate, so this
+    exact real-world container (its average_rate is never exactly 30.0, only
+    ~29.97) would have been treated as a mismatch and "corrected" to a
+    non-integer fps that info.json's int-typed field cannot hold -- producing
+    a dataset trajlens itself could no longer load. After rounding, 29.97
+    rounds to 30, which already matches the declared value: correctly a
+    no-op, nothing to repair.
+    """
+    build_v3_dataset(root, camera=camera, fps=declared_fps)
+    video_path = root / "videos" / camera / "chunk-000" / "file-000.mp4"
+    _write_real_mp4(video_path, fps=Fraction(30000, 1001))
+
+
+def build_v3_video_ntsc_dropframe_declared_wrong(
+    root: Path, *, camera: str = "top", declared_fps: int = 24
+) -> None:
+    """Same NTSC drop-frame container (~29.97, nearest integer 30) as
+    build_v3_video_ntsc_dropframe_declared_matching, but info.json declares
+    an unrelated, genuinely wrong fps (24).
+
+    Regression fixture proving the fix still corrects a REAL mismatch, and
+    writes the rounded whole number (30), never the raw rational (29.97...).
+    """
+    build_v3_dataset(root, camera=camera, fps=declared_fps)
+    video_path = root / "videos" / camera / "chunk-000" / "file-000.mp4"
+    _write_real_mp4(video_path, fps=Fraction(30000, 1001))
 
 
 def build_v3_no_video_feature(root: Path) -> None:
