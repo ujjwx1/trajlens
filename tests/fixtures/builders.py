@@ -516,6 +516,38 @@ def build_v3_non_monotonic_timestamps(root: Path, *, camera: str = "top") -> Non
     pq.write_table(new, data_path)
 
 
+def build_v3_non_monotonic_timestamps_multi(
+    root: Path, *, camera: str = "top", num_episodes: int = 12
+) -> None:
+    """Build a v3.0 dataset where EVERY episode has non-monotonic timestamps.
+
+    Regression fixture for the evidence-truncation bug: TEMPORAL.
+    TIMESTAMP_MONOTONIC used to `break` out of its episode scan after the
+    first offending episode, so its CheckResult.per_episode map -- which
+    feeds report/episodes.py's worst-episodes ranking -- could never hold
+    more than one entry no matter how many episodes were actually broken.
+    num_episodes defaults above both former caps (5 for
+    STRUCTURAL.METADATA_DATA_AGREEMENT, 10 for
+    STATISTICAL.PER_EPISODE_STATS_MATCH) so the same fixture size
+    demonstrates the fix for any of them.
+    """
+    build_v3_dataset(root, num_episodes=num_episodes, camera=camera)
+    data_path = root / "data" / "chunk-000" / "file-000.parquet"
+    old = pq.read_table(data_path)
+    ts = old.column("timestamp").to_pylist()
+    ep = old.column("episode_index").to_pylist()
+    for episode_index in range(num_episodes):
+        indices = [i for i, e in enumerate(ep) if e == episode_index]
+        if len(indices) >= 2:
+            ts[indices[1]], ts[indices[0]] = ts[indices[0]], ts[indices[1]]
+    new = old.set_column(
+        old.schema.get_field_index("timestamp"),
+        "timestamp",
+        pa.array(ts, type=pa.float32()),
+    )
+    pq.write_table(new, data_path)
+
+
 def build_v3_bad_timestamp_spacing(
     root: Path, *, camera: str = "top", gap_multiple: float = 3.0
 ) -> None:

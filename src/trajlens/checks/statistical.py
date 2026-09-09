@@ -45,6 +45,11 @@ import structlog
 
 from trajlens.checks.protocol import Check, CheckContext, CheckResult, Severity
 from trajlens.checks.registry import registry
+from trajlens.checks.utils import (
+    MAX_PER_EPISODE_ENTRIES,
+    MAX_SAMPLE_MESSAGES,
+    format_violation_count,
+)
 from trajlens.checks.welford import WelfordAccumulator
 from trajlens.model.canonical import CanonicalDataset
 
@@ -334,8 +339,21 @@ class _PerEpisodeStatsMatchCheck:
                 message="v2.0 datasets do not carry per-episode stats — check skipped.",
             )
 
+        # Every episode is scanned so total_violations is the TRUE total;
+        # `violations` retains only a bounded sample for display. See
+        # checks/utils.py for why these must stay separate. Note this means a
+        # failing dataset now costs the same full scan a clean one always
+        # did (this check never broke early when nothing was wrong), rather
+        # than bailing at the display cap -- the worst case is unchanged.
         violations: list[str] = []
+        total_violations = 0
         per_episode: dict[int, str] = {}
+
+        def record(finding: str) -> None:
+            nonlocal total_violations
+            total_violations += 1
+            if len(violations) < MAX_SAMPLE_MESSAGES:
+                violations.append(finding)
 
         for episode in ds:
             # Recompute per-episode stats via Welford streaming.
@@ -368,7 +386,7 @@ class _PerEpisodeStatsMatchCheck:
                             f"dimension count mismatch ({len(stored_means)} stored vs "
                             f"{len(accs)} in data)"
                         )
-                        violations.append(finding)
+                        record(finding)
                         ep_findings.append(finding)
                         continue
 
@@ -380,14 +398,14 @@ class _PerEpisodeStatsMatchCheck:
                                 f"episode {episode.episode_index} feature {feat_name!r}: "
                                 f"stored mean={sm:.8g} vs recomputed={acc.mean:.8g}"
                             )
-                            violations.append(finding)
+                            record(finding)
                             ep_findings.append(finding)
                         if _relative_error(ss, acc.std) > _STATS_RTOL:
                             finding = (
                                 f"episode {episode.episode_index} feature {feat_name!r}: "
                                 f"stored std={ss:.8g} vs recomputed={acc.std:.8g}"
                             )
-                            violations.append(finding)
+                            record(finding)
                             ep_findings.append(finding)
 
             elif ds.version is DatasetVersion.V2_1:
@@ -415,7 +433,7 @@ class _PerEpisodeStatsMatchCheck:
                             f"dimension count mismatch ({len(stored_means)} stored vs "
                             f"{len(accs)} in data)"
                         )
-                        violations.append(finding)
+                        record(finding)
                         ep_findings.append(finding)
                         continue
 
@@ -425,31 +443,34 @@ class _PerEpisodeStatsMatchCheck:
                                 f"episode {episode.episode_index} feature {feat_name!r}: "
                                 f"stored mean={sm:.8g} vs recomputed={acc.mean:.8g}"
                             )
-                            violations.append(finding)
+                            record(finding)
                             ep_findings.append(finding)
                         if _relative_error(ss, acc.std) > _STATS_RTOL:
                             finding = (
                                 f"episode {episode.episode_index} feature {feat_name!r}: "
                                 f"stored std={ss:.8g} vs recomputed={acc.std:.8g}"
                             )
-                            violations.append(finding)
+                            record(finding)
                             ep_findings.append(finding)
 
-            if ep_findings:
+            if ep_findings and len(per_episode) < MAX_PER_EPISODE_ENTRIES:
                 per_episode[episode.episode_index] = " | ".join(ep_findings)
 
-            if len(violations) >= 10:
-                break  # Cap output; first batch is enough to diagnose.
-
-        if violations:
+        if total_violations:
             return CheckResult(
                 check_id=self.id,
                 severity=Severity.WARN,
                 message=(
                     f"Per-episode stats diverge from recomputed values "
-                    f"({len(violations)} issue(s)): {violations[0]}"
+                    f"({format_violation_count(total_violations, violations)}): "
+                    f"{violations[0]}"
                 ),
-                details={"violations": violations, "rtol": _STATS_RTOL},
+                details={
+                    "violations": violations,
+                    "total_violations": total_violations,
+                    "affected_episodes": len(per_episode),
+                    "rtol": _STATS_RTOL,
+                },
                 per_episode=per_episode or None,
             )
         return CheckResult(
