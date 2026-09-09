@@ -1,12 +1,22 @@
 """Unit tests for TaskIndexRepairFixer (REPAIR.TASK_INDEX_REPAIR).
 
+TaskIndexRepairFixer is report-only: it never rewrites task_index data.
+See src/trajlens/repair/task_index_repair.py's module docstring for why —
+an earlier version reassigned a dangling reference to whichever defined
+task_index was numerically nearest, which is unsound (task_index is a
+categorical identifier, not an ordinal scale) and could silently relabel a
+frame's ground-truth language instruction to an unrelated task.
+
 Coverage per 05_ENGINEERING_STANDARDS.md §5 and ADR-004:
-  - Happy path + mandatory round-trip test: dangling task_index -> fixer ->
-    re-lint -> SEMANTIC.TASK_INTEGRITY clears, full CheckEngine set-diff.
-  - Byte-identity: every file outside data/ shards is untouched.
-  - Refusal: empty tasks.parquet -> RepairError, zero output files written.
-  - Refusal: ambiguous (equidistant candidates) -> RepairError, zero output
-    files written.
+  - Happy path: dangling task_index -> apply() -> task_index data is
+    byte-for-byte unchanged (not "corrected"), a report is written, and
+    SEMANTIC.TASK_INTEGRITY still fires afterward (nothing was fixed).
+  - Byte-identity: every file outside the new report directory is untouched,
+    including data/ shards (a stronger invariant than the old auto-fix
+    version, which legitimately rewrote data/).
+  - Report contents: dangling references are listed with an advisory-only
+    nearest-task suggestion, explicitly null when no task is defined or the
+    suggestion is ambiguous (neither case raises anymore).
   - Dry-run zero-write (mtime pattern).
   - No-op: already-valid dataset -> noop Diff.
   - Failure modes: v2.x dataset rejected, missing task_index feature rejected.
@@ -26,18 +36,17 @@ from tests.fixtures.builders import (
     build_v3_dataset,
     build_v3_missing_task,
 )
-from trajlens.checks import CheckEngine, registry
 from trajlens.checks.protocol import CheckContext, Severity
 from trajlens.checks.semantic import TASK_INTEGRITY
 from trajlens.errors import RepairError
 from trajlens.model import build_canonical_dataset
-from trajlens.repair.protocol import Diff, FrameChange
+from trajlens.repair.protocol import Diff, FeatureFieldChange
 from trajlens.repair.task_index_repair import (
     CHECK_ID,
     FIXER_ID,
     TaskIndexRepairFixer,
-    _nearest_valid_task,
-    _rewrite_shards,
+    _nearest_valid_task_suggestion,
+    find_dangling_task_references,
 )
 from trajlens.sources.loader import SourceLoader
 
@@ -116,30 +125,35 @@ class TestFixerMetadata:
 
 
 # ---------------------------------------------------------------------------
-# Nearest-valid-task heuristic (pure function)
+# Nearest-valid-task suggestion (pure function, advisory only)
 # ---------------------------------------------------------------------------
 
 
-class TestNearestValidTask:
+class TestNearestValidTaskSuggestion:
     def test_picks_strictly_nearest(self) -> None:
-        assert _nearest_valid_task(7, [0, 5, 10]) == 5
+        assert _nearest_valid_task_suggestion(7, [0, 5, 10]) == 5
 
     def test_exact_match_not_reachable_but_returns_self_if_present(self) -> None:
-        assert _nearest_valid_task(5, [0, 5, 10]) == 5
+        assert _nearest_valid_task_suggestion(5, [0, 5, 10]) == 5
 
-    def test_equidistant_raises_repair_error(self) -> None:
-        with pytest.raises(RepairError, match="equidistant"):
-            _nearest_valid_task(5, [0, 10])
+    def test_equidistant_returns_none_not_a_raise(self) -> None:
+        """An ambiguous suggestion is withheld (None), never guessed or raised --
+        this is advisory information only, not a value that must be resolved."""
+        assert _nearest_valid_task_suggestion(5, [0, 10]) is None
+
+    def test_no_defined_tasks_returns_none(self) -> None:
+        assert _nearest_valid_task_suggestion(5, []) is None
 
 
 # ---------------------------------------------------------------------------
-# Happy path + mandatory ADR-004 round-trip test
+# Report-only behavior (replaces the old auto-fix round-trip)
 # ---------------------------------------------------------------------------
 
 
-class TestRoundTrip:
-    def test_repair_clears_task_integrity_finding(self, tmp_path: Path) -> None:
-        """ADR-004 mandatory round-trip: repair -> re-lint -> finding gone."""
+class TestReportOnly:
+    def test_apply_never_modifies_task_index_data(self, tmp_path: Path) -> None:
+        """The data shard containing the dangling reference must be
+        byte-for-byte identical after apply() -- this fixer only reports."""
         source = tmp_path / "source"
         output = tmp_path / "repaired"
         build_v3_missing_task(source)
@@ -151,45 +165,42 @@ class TestRoundTrip:
         summary = fixer.apply(ds, output)
 
         assert summary.output_path == output
-        assert summary.frames_corrected > 0
-        assert summary.changes_written >= 1
+        assert summary.frames_corrected == 0
+        assert summary.changes_written == 0
 
-        assert not _has_task_integrity_finding(output), (
-            "SEMANTIC.TASK_INTEGRITY must be INFO after repair"
-        )
+        data_path = "data/chunk-000/file-000.parquet"
+        assert (source / data_path).read_bytes() == (output / data_path).read_bytes()
 
-    def test_no_new_finding_introduced_full_check_engine(self, tmp_path: Path) -> None:
-        """Full CheckEngine set-diff: no new WARN/FAIL introduced by repair."""
+    def test_finding_persists_after_apply(self, tmp_path: Path) -> None:
+        """SEMANTIC.TASK_INTEGRITY must still fire after apply() -- nothing
+        was corrected, so the finding must not silently disappear."""
         source = tmp_path / "source"
         output = tmp_path / "repaired"
         build_v3_missing_task(source)
 
-        engine = CheckEngine(registry)
+        fixer = TaskIndexRepairFixer()
+        fixer.apply(_load(source), output)
 
-        ds_source = _load(source)
-        pre_results = engine.run(ds_source, CTX)
-        pre_fail_ids = {
-            r.check_id
-            for r in pre_results
-            if r.severity >= Severity.WARN and r.check_id != CHECK_ID
-        }
+        assert _has_task_integrity_finding(output), (
+            "the finding must persist -- this fixer never corrects task_index"
+        )
+
+    def test_apply_writes_report_for_dangling_references(self, tmp_path: Path) -> None:
+        source = tmp_path / "source"
+        output = tmp_path / "repaired"
+        build_v3_missing_task(source)
 
         fixer = TaskIndexRepairFixer()
-        fixer.apply(ds_source, output)
+        fixer.apply(_load(source), output)
 
-        ds_fixed = _load(output)
-        post_results = engine.run(ds_fixed, CTX)
-
-        task_post = next((r for r in post_results if r.check_id == CHECK_ID), None)
-        assert task_post is None or task_post.severity < Severity.WARN
-
-        post_fail_ids = {
-            r.check_id
-            for r in post_results
-            if r.severity >= Severity.WARN and r.check_id != CHECK_ID
-        }
-        new_findings = post_fail_ids - pre_fail_ids
-        assert not new_findings, f"repair introduced new findings: {new_findings}"
+        report_path = output / ".trajlens-task-index-report" / "dangling_task_index_report.json"
+        assert report_path.is_file()
+        report = json.loads(report_path.read_text())
+        assert len(report) == 1
+        entry = report[0]
+        assert entry["task_index"] == 99
+        assert entry["nearest_defined_task_index_suggestion"] == 0  # advisory only
+        assert "not modified" in entry["note"].lower() or "NOT modified" in entry["note"]
 
     def test_dry_run_produces_no_filesystem_writes(self, tmp_path: Path) -> None:
         source = tmp_path / "source"
@@ -207,6 +218,8 @@ class TestRoundTrip:
         assert not diff.is_noop
 
     def test_dry_run_diff_contents(self, tmp_path: Path) -> None:
+        """The Diff is a report: old_value == new_value == the dangling
+        task_index, never a proposed replacement value."""
         source = tmp_path / "source"
         build_v3_missing_task(source)
 
@@ -220,19 +233,20 @@ class TestRoundTrip:
         assert len(diff.changes) == 1
 
         change = diff.changes[0]
-        assert isinstance(change, FrameChange)
-        assert change.column == "task_index"
+        assert isinstance(change, FeatureFieldChange)
+        assert change.field == "task_index"
         assert change.old_value == 99
-        assert change.new_value == 0  # only defined task_index is 0
+        assert change.new_value == 99  # unchanged -- reported, not corrected
 
 
 # ---------------------------------------------------------------------------
-# Byte-identity outside data/ shards
+# Byte-identity outside the report directory (stronger than before: data/ is
+# now included, since this fixer never rewrites it)
 # ---------------------------------------------------------------------------
 
 
 class TestByteIdentity:
-    def test_only_data_shards_change_everything_else_byte_identical(self, tmp_path: Path) -> None:
+    def test_everything_byte_identical_outside_the_report_dir(self, tmp_path: Path) -> None:
         source = tmp_path / "source"
         output = tmp_path / "repaired"
         build_v3_missing_task(source)
@@ -242,25 +256,31 @@ class TestByteIdentity:
         fixer.apply(ds, output)
 
         source_files = {p.relative_to(source): p for p in source.rglob("*") if p.is_file()}
-        output_files = {p.relative_to(output): p for p in output.rglob("*") if p.is_file()}
-        assert set(source_files) == set(output_files), "apply() must not add or remove files"
+        output_files = {
+            p.relative_to(output): p
+            for p in output.rglob("*")
+            if p.is_file() and ".trajlens-task-index-report" not in p.parts
+        }
+        assert set(source_files) == set(output_files), (
+            "apply() must not add or remove any file outside the report dir"
+        )
 
         for rel, src_path in source_files.items():
             out_path = output_files[rel]
-            if str(rel).startswith("data/"):
-                continue  # the rewritten shard(s) are expected to differ
             assert src_path.read_bytes() == out_path.read_bytes(), (
-                f"{rel} differs between source and repaired output, but is outside data/"
+                f"{rel} differs between source and repaired output"
             )
 
 
 # ---------------------------------------------------------------------------
-# Refusals
+# Formerly-refusal cases: now reported with an advisory None, never raised
 # ---------------------------------------------------------------------------
 
 
-class TestRefusals:
-    def test_empty_tasks_table_raises_repair_error_and_writes_nothing(self, tmp_path: Path) -> None:
+class TestAdvisoryOnlyEdgeCases:
+    def test_empty_tasks_table_reports_with_no_suggestion(self, tmp_path: Path) -> None:
+        """No defined task exists: the reference is still reported; the
+        suggestion is None, and this is no longer a fatal condition."""
         source = tmp_path / "source"
         output = tmp_path / "repaired"
         build_v3_missing_task(source)
@@ -269,16 +289,16 @@ class TestRefusals:
         fixer = TaskIndexRepairFixer()
         ds = _load(source)
 
-        with pytest.raises(RepairError, match="no tasks at all"):
-            fixer.dry_run(ds)
+        diff = fixer.dry_run(ds)
+        assert not diff.is_noop
 
-        with pytest.raises(RepairError):
-            fixer.apply(ds, output)
-        assert not output.exists(), "apply() must write nothing on refusal"
+        fixer.apply(ds, output)  # must not raise
+        report = json.loads(
+            (output / ".trajlens-task-index-report" / "dangling_task_index_report.json").read_text()
+        )
+        assert report[0]["nearest_defined_task_index_suggestion"] is None
 
-    def test_ambiguous_equidistant_raises_repair_error_and_writes_nothing(
-        self, tmp_path: Path
-    ) -> None:
+    def test_ambiguous_equidistant_reports_with_no_suggestion(self, tmp_path: Path) -> None:
         source = tmp_path / "source"
         output = tmp_path / "repaired"
         _build_two_task_dataset_with_dangling_between(source)
@@ -286,12 +306,36 @@ class TestRefusals:
         fixer = TaskIndexRepairFixer()
         ds = _load(source)
 
-        with pytest.raises(RepairError, match="equidistant"):
-            fixer.dry_run(ds)
+        diff = fixer.dry_run(ds)
+        assert not diff.is_noop
 
-        with pytest.raises(RepairError):
-            fixer.apply(ds, output)
-        assert not output.exists(), "apply() must write nothing on refusal"
+        fixer.apply(ds, output)  # must not raise
+        report = json.loads(
+            (output / ".trajlens-task-index-report" / "dangling_task_index_report.json").read_text()
+        )
+        assert report[0]["nearest_defined_task_index_suggestion"] is None
+
+
+# ---------------------------------------------------------------------------
+# find_dangling_task_references (pure detection function)
+# ---------------------------------------------------------------------------
+
+
+class TestFindDanglingTaskReferences:
+    def test_finds_the_one_dangling_reference(self, tmp_path: Path) -> None:
+        source = tmp_path / "source"
+        build_v3_missing_task(source)
+
+        refs = find_dangling_task_references(_load(source))
+        assert len(refs) == 1
+        assert refs[0].task_index == 99
+        assert refs[0].nearest_defined_task_index_suggestion == 0
+
+    def test_clean_dataset_finds_none(self, tmp_path: Path) -> None:
+        source = tmp_path / "source"
+        build_v3_dataset(source, num_episodes=3)
+
+        assert find_dangling_task_references(_load(source)) == []
 
 
 # ---------------------------------------------------------------------------
@@ -323,6 +367,7 @@ class TestEdgeCases:
         assert summary.frames_corrected == 0
         assert summary.changes_written == 0
         assert output.is_dir()
+        assert not (output / ".trajlens-task-index-report").exists()
 
     def test_zero_episodes_is_noop(self, tmp_path: Path) -> None:
         source = tmp_path / "source"
@@ -346,40 +391,6 @@ class TestEdgeCases:
 
         with pytest.raises(RepairError, match="copy-on-write"):
             fixer.apply(ds, source)
-
-
-# ---------------------------------------------------------------------------
-# apply() only rewrites diff shards
-# ---------------------------------------------------------------------------
-
-
-class TestApplyOnlyTouchesDiffShards:
-    def test_apply_only_rewrites_shards_in_diff(self, tmp_path: Path) -> None:
-        import shutil as _shutil
-
-        source = tmp_path / "source"
-        output = tmp_path / "repaired"
-        build_v3_missing_task(source)
-
-        fixer = TaskIndexRepairFixer()
-        ds = _load(source)
-        diff = fixer.dry_run(ds)
-        assert not diff.is_noop
-
-        diff_shard_relpaths = {c.shard_path for c in diff.changes}
-
-        _shutil.copytree(source, output)
-        baseline_mtimes = {p: p.stat().st_mtime for p in output.rglob("*.parquet")}
-
-        _rewrite_shards(diff, output_root=output)
-
-        for shard_abs, before_mtime in baseline_mtimes.items():
-            rel = str(shard_abs.relative_to(output))
-            after_mtime = shard_abs.stat().st_mtime
-            if after_mtime != before_mtime:
-                assert rel in diff_shard_relpaths, (
-                    f"shard '{rel}' rewritten but not in diff.changes"
-                )
 
 
 # ---------------------------------------------------------------------------
@@ -407,22 +418,3 @@ class TestFailureModes:
 
         with pytest.raises(RepairError, match="task_index"):
             fixer.dry_run(ds)
-
-    def test_corrupt_output_shard_raises(self, tmp_path: Path) -> None:
-        import shutil as _shutil
-
-        source = tmp_path / "source"
-        output = tmp_path / "repaired"
-        build_v3_missing_task(source)
-
-        fixer = TaskIndexRepairFixer()
-        ds = _load(source)
-        diff = fixer.dry_run(ds)
-        assert not diff.is_noop
-
-        _shutil.copytree(source, output)
-        shard = output / "data" / "chunk-000" / "file-000.parquet"
-        shard.write_bytes(b"CORRUPTED_NOT_PARQUET")
-
-        with pytest.raises(Exception):  # noqa: B017
-            _rewrite_shards(diff, output_root=output)

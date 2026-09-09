@@ -50,13 +50,14 @@ stats_recompute streams. episode_reindex is placed first only because
 restore first; timestamp_dedrift and episode_reindex have no dependency on
 each other in either order.
 
-task_index_repair (rewrites task_index only), video_metadata_sync
-(rewrites meta/info.json's fps only), and orphan_shard_report (only ever
-moves already-unreferenced files) are appended after the original three:
-none of them read or write a column or field any other fixer touches, so
-they have no ordering dependency on the first three or each other --
-placed last simply because they were added later, not because order matters
-for them.
+task_index_repair (report-only: never rewrites task_index -- a dangling
+reference has no principled automatic correction, see
+task_index_repair.py's module docstring), video_metadata_sync (rewrites
+meta/info.json's fps only), and orphan_shard_report (only ever moves
+already-unreferenced files) are appended after the original three: none of
+them read or write a column or field any other fixer touches, so they have
+no ordering dependency on the first three or each other -- placed last
+simply because they were added later, not because order matters for them.
 
 Note: video_metadata_sync's target check, VIDEO.RESOLUTION_FPS_MATCH, is
 not yet implemented (checks/video.py defers it to a later milestone), so
